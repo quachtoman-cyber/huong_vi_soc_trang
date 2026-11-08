@@ -1,0 +1,14 @@
+# Private runtime data
+website_data.sqlite3
+website_data.sqlite3-wal
+website_data.sqlite3-shm
+THONG_TIN_TAI_KHOAN.txt
+TAI_KHOAN_6_THANH_VIEN.txt
+accounts_seed.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
