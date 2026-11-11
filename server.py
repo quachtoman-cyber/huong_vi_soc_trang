@@ -3,13 +3,13 @@
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import urlparse
 from pathlib import Path
-import sqlite3, hashlib, secrets, json, os, time, hmac, threading, mimetypes
+import sqlite3, hashlib, secrets, json, os, time, hmac, threading, mimetypes, re
 from http.cookies import SimpleCookie
 from datetime import datetime
 
 ROOT = Path(__file__).resolve().parent
 DB = ROOT / "website_data.sqlite3"
-HOST = "127.0.0.1"
+HOST = "0.0.0.0"
 PORT = 8000
 ITERATIONS = 310_000
 sessions = {}
@@ -35,32 +35,31 @@ def initialize():
             username TEXT PRIMARY KEY, display_name TEXT NOT NULL,
             salt TEXT NOT NULL, password_hash TEXT NOT NULL, created_at TEXT NOT NULL)""")
         con.execute("""CREATE TABLE IF NOT EXISTS posts(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, body TEXT NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, body TEXT NOT NULL, image_data TEXT NOT NULL DEFAULT '',
             author TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+        columns = [row["name"] for row in con.execute("PRAGMA table_info(posts)").fetchall()]
+        if "image_data" not in columns:
+            con.execute("ALTER TABLE posts ADD COLUMN image_data TEXT NOT NULL DEFAULT ''")
         if first_run:
-            accounts = []
-            for i in range(1, 7):
-                accounts.append({
-                    "username": f"thanhvien{i:02d}",
-                    "display_name": f"Thành viên {i}",
-                    "password": secrets.token_urlsafe(12)
-                })
+            seed_path = ROOT / "accounts_seed.json"
+            if not seed_path.exists():
+                raise RuntimeError("Thiếu accounts_seed.json. Hãy giải nén lại đầy đủ bộ cài.")
+            accounts = json.loads(seed_path.read_text(encoding="utf-8"))
             for account in accounts:
                 salt, digest = hash_password(account["password"])
                 con.execute("INSERT INTO users VALUES(?,?,?,?,?)",
                     (account["username"], account["display_name"], salt, digest,
                      datetime.now().strftime("%d/%m/%Y %H:%M")))
-            # Credentials are generated locally and must never be committed.
-            credential_file = ROOT / "THONG_TIN_TAI_KHOAN.txt"
-            with credential_file.open("w", encoding="utf-8") as f:
-                f.write("TÀI KHOẢN MỚI - CHỈ LƯU TRÊN MÁY CHẠY WEBSITE\\n")
-                f.write("Gửi riêng mật khẩu cho đúng thành viên và yêu cầu đổi ngay.\\n\\n")
-                for account in accounts:
-                    f.write(f"{account['display_name']}\\nTên đăng nhập: {account['username']}\\nMật khẩu tạm: {account['password']}\\n\\n")
-            print("Đã tạo 6 tài khoản mới. Xem THONG_TIN_TAI_KHOAN.txt (không tải tệp này lên mạng).")
+            seed_path.unlink(missing_ok=True)
+            print("Đã khởi tạo 6 tài khoản từ tệp tài khoản đi kèm.")
 
 def now_text():
     return datetime.now().strftime("%d/%m/%Y %H:%M")
+
+def re_image_data(value):
+    if len(value) > 7_000_000:
+        return False
+    return bool(re.fullmatch(r"data:image/(?:jpeg|png|webp|gif);base64,[A-Za-z0-9+/]+={0,2}", value))
 
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
@@ -84,7 +83,7 @@ class Handler(SimpleHTTPRequestHandler):
     def body_json(self):
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if length > 200_000:
+            if length > 8_000_000:
                 raise ValueError()
             return json.loads(self.rfile.read(length) or b"{}")
         except Exception:
@@ -132,7 +131,7 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json(200, {"user": dict(row) if row else None})
         if path == "/api/posts":
             with connect() as con:
-                rows = con.execute("SELECT id,title,body,author,created_at FROM posts ORDER BY id DESC").fetchall()
+                rows = con.execute("SELECT id,title,body,image_data,author,created_at FROM posts ORDER BY id DESC").fetchall()
             return self.send_json(200, {"posts": [dict(r) for r in rows]})
         if path == "/":
             self.path = "/website.html"
@@ -186,13 +185,16 @@ class Handler(SimpleHTTPRequestHandler):
             username = self.require_user()
             if not username: return
             title, body = str(data.get("title", "")).strip(), str(data.get("body", "")).strip()
+            image_data = str(data.get("image_data", ""))
+            if image_data and not re_image_data(image_data):
+                return self.send_json(400, {"error": "Ảnh không hợp lệ. Chỉ hỗ trợ JPG, PNG, WEBP hoặc GIF; tối đa 5 MB."})
             if not title or not body or len(title) > 120 or len(body) > 10000:
                 return self.send_json(400, {"error": "Tiêu đề/nội dung không hợp lệ hoặc vượt giới hạn."})
             with connect() as con:
                 row = con.execute("SELECT display_name FROM users WHERE username=?", (username,)).fetchone()
                 stamp = now_text()
-                cur = con.execute("INSERT INTO posts(title,body,author,created_at,updated_at) VALUES(?,?,?,?,?)",
-                    (title,body,row["display_name"],stamp,stamp))
+                cur = con.execute("INSERT INTO posts(title,body,image_data,author,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                    (title,body,image_data,row["display_name"],stamp,stamp))
                 post_id = cur.lastrowid
             return self.send_json(201, {"ok": True, "id": post_id})
         return self.send_json(404, {"error": "Không tìm thấy chức năng."})
@@ -206,11 +208,20 @@ class Handler(SimpleHTTPRequestHandler):
         try: post_id = int(path.rsplit("/",1)[1])
         except Exception: return self.send_json(404, {"error": "Không tìm thấy bài viết."})
         title, body = str(data.get("title","")).strip(), str(data.get("body","")).strip()
+        image_data = data.get("image_data", None)
+        if image_data is not None:
+            image_data = str(image_data)
+            if image_data and not re_image_data(image_data):
+                return self.send_json(400, {"error": "Ảnh không hợp lệ. Chỉ hỗ trợ JPG, PNG, WEBP hoặc GIF; tối đa 5 MB."})
         if not title or not body or len(title)>120 or len(body)>10000:
             return self.send_json(400, {"error": "Tiêu đề/nội dung không hợp lệ hoặc vượt giới hạn."})
         with connect() as con:
-            cur = con.execute("UPDATE posts SET title=?,body=?,updated_at=? WHERE id=?",
-                (title,body,now_text(),post_id))
+            if image_data is None:
+                cur = con.execute("UPDATE posts SET title=?,body=?,updated_at=? WHERE id=?",
+                    (title,body,now_text(),post_id))
+            else:
+                cur = con.execute("UPDATE posts SET title=?,body=?,image_data=?,updated_at=? WHERE id=?",
+                    (title,body,image_data,now_text(),post_id))
             if not cur.rowcount: return self.send_json(404, {"error": "Bài viết không tồn tại."})
         return self.send_json(200, {"ok": True})
 
